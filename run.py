@@ -34,13 +34,13 @@ _load_dotenv()
 
 
 MODEL_MAPPING: dict[str, str] = {
-    "deepseek/deepseek-v3.2": "deepseek",
-    "openai/gpt-5.4": "gpt",
-    "qwen/qwen3.5-35b-a3b": "qwen",
-    "google/gemini-3-flash-preview": "gemini",
-    "anthropic/claude-sonnet-4.6": "claude",
+    "deepseek/deepseek-v4-pro": "deepseek",
+    "openai/gpt-5.5": "gpt",
+    "qwen/qwen3.7-max": "qwen",
+    "google/gemini-3.5-flash": "gemini",
+    "anthropic/claude-fable-5": "claude",
+    "z-ai/glm-5.2": "glm"
 }
-
 
 def _model_short(model: str) -> str:
     """Map full model ID to a short display name.
