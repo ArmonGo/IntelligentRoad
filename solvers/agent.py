@@ -4,17 +4,20 @@ import json
 import os
 import sys
 import time
-from collections import deque
+from collections import deque, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
+import numpy as np
 import io as _io
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from minisim import TrafficSim, TileType, DIR4, Pos
-from solvers.utils import world_to_json, evaluate
+from solvers.utils import world_to_json, evaluate, validate_plan
 
-DEFAULT_MODEL = "openrouter/deepseek/deepseek-v3.2" # change this setting in run.py
-DEFAULT_MAX_CALLS = 15  # same change this in run.py
+DEFAULT_MODEL = "openrouter/deepseek/deepseek-v3.2"
+DEFAULT_MAX_CALLS = 15  # safety ceiling on tool calls per agent run
+DEFAULT_MAX_TOKENS = 16384
+
 
 def _build_client(api_key: Optional[str] = None):
     """Return an OpenAI-compatible client pointed at OpenRouter."""
@@ -34,16 +37,16 @@ def _call_llm(
     model: str,
     messages: list[dict],
     tools: Optional[list[dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     retries: int = 3,
     session_id: Optional[str] = None,
     user: Optional[str] = None,
 ):
     """Call the LLM API with optional OpenRouter trace fields.
 
-    session_id : groups all turns of one agent session — filter on
+    session_id : groups all turns of one agent session - filter on
                  openrouter.ai/activity by session to see per-session cost.
-    user       : broader grouping (e.g. run_id) — lets you see cost for a
+    user       : broader grouping (e.g. run_id) - lets you see cost for a
                  whole experiment run across all its sessions.
     """
     delay = 2.0
@@ -95,8 +98,6 @@ def _apply_roads(sim: TrafficSim, roads_list: list[dict]) -> list[str]:
 
 
 def _check_connectivity(sim: TrafficSim) -> list[str]:
-    """BFS check: return error strings for depot_in tiles unreachable from any depot_out.
-    Manually roll back"""
     depots_out = [d for d in sim.init_depots.values() if d.kind == "out"]
     depots_in = [d for d in sim.init_depots.values() if d.kind == "in"]
     errors: list[str] = []
@@ -161,6 +162,8 @@ def _parse_agent_car_plan(
 
     depots_out = {d.id: d for d in sim.init_depots.values() if d.kind == "out"}
     depots_in = {d.id: d for d in sim.init_depots.values() if d.kind == "in"}
+    assigned_out: dict[int, int] = defaultdict(int)
+    assigned_in: dict[int, int] = defaultdict(int)
 
     for i, c in enumerate(cars):
         try:
@@ -182,6 +185,8 @@ def _parse_agent_car_plan(
             continue
         d_out = depots_out[from_id]
         d_in = depots_in[to_id]
+        assigned_out[from_id] += 1
+        assigned_in[to_id] += 1
         # no path
         if not path:
             errors.append(f"cars[{i}]: empty path")
@@ -199,6 +204,14 @@ def _parse_agent_car_plan(
                     f"(is {sim.grid[pos[0]][pos[1]].name})"
                 )
                 break
+        seq = [d_out.pos] + path
+        for a, b in zip(seq, seq[1:]):
+            if abs(a[0] - b[0]) + abs(a[1] - b[1]) != 1:
+                errors.append(
+                    f"cars[{i}]: non-adjacent step {a} -> {b} "
+                    f"(no teleport; move one tile up/down/left/right)"
+                )
+                break
         idx = len(car_plan)
         car_plan.append(
             {
@@ -209,6 +222,20 @@ def _parse_agent_car_plan(
             }
         )
         departures[idx] = depart
+
+    total_supply = sum(d.amount for d in depots_out.values())
+    if len(cars) != total_supply:
+        errors.append(f"car count {len(cars)} != total supply {total_supply}")
+    for d_id, d in depots_out.items():
+        if assigned_out[d_id] != d.amount:
+            errors.append(
+                f"depot_out {d_id}: {assigned_out[d_id]} cars assigned but supply={d.amount}"
+            )
+    for d_id, d in depots_in.items():
+        if assigned_in[d_id] != d.amount:
+            errors.append(
+                f"depot_in {d_id}: {assigned_in[d_id]} cars assigned but demand={d.amount}"
+            )
     return car_plan, departures, errors
 
 
@@ -417,14 +444,18 @@ _TOOLS_ROUTING = [_TOOL_GET_WORLD, _TOOL_PROPOSE_ROUTES, _TOOL_SUBMIT_ROUTES]
 
 
 # Tool executors
+
+
 def _make_world_executor(world_json: dict) -> Callable:
     def _exec(_: dict) -> dict:
         return world_json
+
     return _exec
 
 
 def _make_network_executor(sim: TrafficSim, route_solver_fn: Callable) -> Callable:
     """Returns a tool executor for propose_network."""
+
     def _exec(args: dict) -> dict:
         roads = args.get("roads", [])
         phase = args.get("phase", "minimize_makespan")
@@ -482,6 +513,7 @@ def _make_network_executor(sim: TrafficSim, route_solver_fn: Callable) -> Callab
 
 def _make_plan_executor(sim: TrafficSim) -> Callable:
     """Returns a tool executor for propose_plan (joint: roads + car routes, replay)."""
+
     def _exec(args: dict) -> dict:
         roads = args.get("roads", [])
         cars_raw = args.get("cars", [])
@@ -528,6 +560,7 @@ def _make_plan_executor(sim: TrafficSim) -> Callable:
             "phase": phase,
         }
         return llm_result
+
     return _exec
 
 
@@ -569,7 +602,8 @@ def _make_routes_executor(sim: TrafficSim) -> Callable:
 
     return _exec
 
-# Best-result tracker, but didnt use it at the end. use the submitted solution only
+
+# Best-result tracker
 def update_best(best: dict, llm_result: dict, verbose: bool) -> None:
     """Update best solution in-place if the new result is better."""
     makespan = llm_result.get("makespan")
@@ -614,7 +648,9 @@ def update_last_proposal(last_proposal: dict, llm_result: dict) -> None:
     last_proposal["roads"] = internal.get("roads", [])
     last_proposal["occ"] = internal.get("occ")
 
+
 # Core agent loop
+
 def _run_agent_loop(
     sim: TrafficSim,
     model: str,
@@ -630,10 +666,6 @@ def _run_agent_loop(
     session_id: Optional[str] = None,
     user: Optional[str] = None,
 ) -> tuple[dict, list[dict]]:
-    """ The agent calls tools freely until it either:
-      - Returns a message with no tool_calls (signals it is done), or
-      - The safety ceiling max_tool_calls is reached.
-    """
     best: dict = {
         "makespan": None,
         "road_cost": None,
@@ -706,17 +738,24 @@ def _run_agent_loop(
 
     tool_calls_made = 0
     done = False  # set to True when agent calls a submit_* tool
+    aborted = False  # set to True when the session is force-ended (e.g. bad submits)
     no_tool_streak = 0  # consecutive LLM turns with no tool calls
-    _MAX_NO_TOOL = 3  # give up after this many consecutive nudges
+    _MAX_NO_TOOL = 5  # give up after this many consecutive reasoning-only turns
+    submit_format_fails = 0  # count of malformed/empty submit_* attempts
+    _MAX_SUBMIT_FAILS = 3  # give up after this many bad submits
     _final_warned = False  # True once the "last chance" warning has been injected
+    world_inspected = False  # True once the agent has called get_world_json
 
-    # Build per-tool format hints from the schemas passed in, for format reminders
+    # Build per-tool format hints + required-field lists from the schemas passed
+    # in, for format reminders and submit validation.
     _tool_hints: dict[str, str] = {}
+    _tool_required: dict[str, list[str]] = {}
     for _t in tools:
         _fn = _t.get("function", {})
         _tname = _fn.get("name", "")
         _params = _fn.get("parameters", {})
         _required = _params.get("required", [])
+        _tool_required[_tname] = list(_required)
         _props = _params.get("properties", {})
         _hints = []
         for _f in _required:
@@ -724,26 +763,29 @@ def _run_agent_loop(
             _hints.append(f'"{_f}" ({_desc})')
         _tool_hints[_tname] = ", ".join(_hints) if _hints else "(no required fields)"
 
-    while tool_calls_made < max_tool_calls and not done:
-        # Inject a "last chance" warning when only a few calls remain
+    while tool_calls_made < max_tool_calls and not done and not aborted:
+        # Inject a "last chance" warning while a few calls still remain, so the
+        # agent has room to submit (and re-submit if a submit is rejected).
         remaining = max_tool_calls - tool_calls_made
-        if not _final_warned and remaining <= 1:
+        if not _final_warned and remaining <= 3:
             _final_warned = True
             has_proposal = last_proposal["makespan"] is not None
             if has_proposal:
                 warn = (
-                    f"You have {remaining} tool call left. "
+                    f"You have only {remaining} tool call(s) left. "
                     f"Your best proposal so far: makespan={last_proposal['makespan']}  "
                     f"cost={last_proposal['road_cost']}  "
                     f"delivered={last_proposal['all_delivered']}. "
-                    "Use your last call to submit your best solution via the applicable "
-                    "submit_* tool (i.e. `submit_network` / `submit_plan` / `submit_routes`) NOW with your best solution."
+                    "Submit your best solution NOW via the applicable submit_* tool "
+                    "(`submit_network` / `submit_plan` / `submit_routes`) — send the COMPLETE "
+                    "roads/cars JSON and keep any 'reason' short so it isn't truncated."
                 )
             else:
                 warn = (
-                    f"You have {remaining} tool call left. Without any valid solutions so far. "
-                    "Still, call a submit_* tool (i.e. `submit_network` / `submit_plan` / `submit_routes`) "
-                    "NOW with your best solution."
+                    f"You have only {remaining} tool call(s) left and no valid solution yet. "
+                    "Call a submit_* tool (`submit_network` / `submit_plan` / `submit_routes`) "
+                    "NOW with your best solution — send the COMPLETE roads/cars JSON and keep "
+                    "any 'reason' short so it isn't truncated."
                 )
             messages.append({"role": "user", "content": warn})
             _log({"type": "final_warning", "content": warn, "remaining": remaining})
@@ -754,8 +796,7 @@ def _run_agent_loop(
             client, model, messages, tools=tools, session_id=session_id, user=user
         )
         msg = response.choices[0].message
-        # Some models surface chain-of-thought in a separate field rather than
-        # msg.content (e.g. msg.reasoning, msg.reasoning_content, model_extra).
+
         reasoning: str | None = (
             getattr(msg, "reasoning", None)
             or getattr(msg, "reasoning_content", None)
@@ -786,38 +827,77 @@ def _run_agent_loop(
                     f"[agent] reasoning: {preview}{'…' if len(msg.content) > 120 else ''}"
                 )
 
-        # No tool calls in this turn
         if not msg.tool_calls:
             no_tool_streak += 1
-            # Hard stop after too many consecutive no-tool turns
-            if no_tool_streak >= _MAX_NO_TOOL:
-                if verbose or debug:
-                    print(
-                        f"[agent] WARNING: agent produced no tool calls {no_tool_streak} times "
-                        f"in a row without submitting --- stopping."
-                    )
-                break
-
-            # Nudge the agent back to using tools
+            remaining = max_tool_calls - tool_calls_made
             has_proposal = last_proposal["makespan"] is not None
+            last_chance = no_tool_streak >= _MAX_NO_TOOL
+
             if has_proposal:
-                nudge = (
-                    "You have not submitted your solution yet. "
-                    "When satisfied, call a submit_* tool (i.e. `submit_network` / `submit_plan` / `submit_routes`) "
-                    "with the exact solution you want to commit. "
-                    "Otherwise keep using the propose_* tools to improve."
+                push = (
+                    f"You have a valid proposal (makespan={last_proposal['makespan']}, "
+                    f"cost={last_proposal['road_cost']}, "
+                    f"delivered={last_proposal['all_delivered']}) that is NOT yet submitted, "
+                    f"and {remaining} tool call(s) left. Do NOT end the session — call a "
+                    "submit_* tool (`submit_network` / `submit_plan` / `submit_routes`) NOW to "
+                    "commit it (submitting is final). Keep exploring with propose_* only if you "
+                    "intend to improve it first."
+                )
+            elif world_inspected:
+                push = (
+                    f"You have {remaining} tool call(s) left and have proposed nothing yet. "
+                    "You have already inspected the map with get_world_json — now call a "
+                    "propose_* tool to evaluate a solution; once it works, call a submit_* tool "
+                    "to commit it."
                 )
             else:
-                nudge = (
-                    "No solution has been proposed yet. "
-                    "Please use the available tools — start with get_world_json to inspect the map, "
-                    "then call a propose_* tool to evaluate a solution."
+                push = (
+                    f"You have {remaining} tool call(s) left and have proposed nothing yet. "
+                    "Do NOT end the session. Call get_world_json to inspect the map, then a "
+                    "propose_* tool to evaluate a solution; once it works, call a submit_* tool "
+                    "to commit it."
+                )
+            # Escalate firmness the longer the agent refuses to act.
+            if no_tool_streak >= 2:
+                push += (
+                    " Reasoning alone is NOT recorded and does NOT count — you MUST call a tool "
+                    "this turn."
+                )
+            if last_chance:
+                push += (
+                    " This is your final reminder: call a tool now or the session ends and your "
+                    "work is lost."
                 )
 
+            messages.append({"role": "user", "content": push})
+            _log({"type": "nudge", "content": push, "streak": no_tool_streak,
+                  "has_proposal": has_proposal, "last_chance": last_chance})
             if verbose or debug:
-                print(f"[agent] no tool call (streak {no_tool_streak}/{_MAX_NO_TOOL}) ")
-            messages.append({"role": "user", "content": nudge})
-            _log({"type": "nudge", "content": nudge, "streak": no_tool_streak})
+                print(f"[agent] no tool call (streak {no_tool_streak}/{_MAX_NO_TOOL}) "
+                      f"has_proposal={has_proposal} — pushed to "
+                      f"{'submit' if has_proposal else 'propose'}")
+
+            # Stop only after delivering the final push, so the model always got it.
+            if last_chance:
+                _log({
+                    "type": "forced_stop",
+                    "reason": "no_tool_calls",
+                    "streak": no_tool_streak,
+                    "max_no_tool": _MAX_NO_TOOL,
+                    "has_proposal": has_proposal,
+                    "submitted": done,
+                    "tool_calls_made": tool_calls_made,
+                    "content": (
+                        f"Agent reasoned {no_tool_streak} times in a row without calling a "
+                        f"tool (limit {_MAX_NO_TOOL}); session forced to stop without submitting."
+                    ),
+                })
+                if verbose or debug:
+                    print(
+                        f"[agent] WARNING: {no_tool_streak} consecutive reasoning-only turns "
+                        f"without acting --- stopping."
+                    )
+                break
             continue
 
         # Agent called at least one tool - reset the no-tool streak
@@ -842,6 +922,8 @@ def _run_agent_loop(
         for tc in msg.tool_calls:
             tool_calls_made += 1
             name = tc.function.name
+            if name == "get_world_json":
+                world_inspected = True
             args_malformed = False
             try:
                 args = json.loads(tc.function.arguments or "{}")
@@ -853,8 +935,6 @@ def _run_agent_loop(
                 args = {}
                 args_malformed = True
 
-            # Dispatch all tools through executors (submit_* share the same
-            # executor as their propose_* counterpart but also trigger done=True)
             executor = executors.get(name)
             if executor is None:
                 result = {"error": f"unknown tool: {name}"}
@@ -866,24 +946,52 @@ def _run_agent_loop(
                     if verbose or debug:
                         print(f"[agent] tool {name} raised exception: {_exec_exc}")
 
-            # Commit logic for submit_* tools
+            # Commit logic for submit_* tools but ONLY if the submission is well-formed. check the anwser format
+            submit_rejected_why: Optional[str] = None
             if name in _SUBMIT_NAMES:
-                update_best(best, result, verbose)
-                update_last_proposal(last_proposal, result)
-                submitted.update(last_proposal)
-                done = True
-                reason = args.get("reason", "")
-                clean_result = {k: v for k, v in result.items() if k != "_internal"}
-                clean_result["submitted"] = True
-                clean_result["message"] = "Solution committed as final answer."
-                result = clean_result
-                if verbose or debug:
-                    print(
-                        f"[agent] submitted makespan={submitted['makespan']}  "
-                        f"cost={submitted['road_cost']}  "
-                        f"delivered={submitted['all_delivered']}"
-                        + (f"reason={reason!r}" if reason else "")
+                required = _tool_required.get(name, [])
+                if args_malformed:
+                    submit_rejected_why = (
+                        "the arguments were not valid JSON (likely truncated)"
                     )
+                else:
+                    missing = [f for f in required if not args.get(f)]
+                    if missing:
+                        submit_rejected_why = (
+                            "missing or empty required field(s): " + ", ".join(missing)
+                        )
+
+                if submit_rejected_why is None:
+                    # Well-formed submit
+                    update_best(best, result, verbose)
+                    update_last_proposal(last_proposal, result)
+                    submitted.update(last_proposal)
+                    done = True
+                    reason = args.get("reason", "")
+                    clean_result = {k: v for k, v in result.items() if k != "_internal"}
+                    clean_result["submitted"] = True
+                    clean_result["message"] = "Solution committed as final answer."
+                    result = clean_result
+                    if verbose or debug:
+                        print(
+                            f"[agent] submitted makespan={submitted['makespan']}  "
+                            f"cost={submitted['road_cost']}  "
+                            f"delivered={submitted['all_delivered']}"
+                            + (f"reason={reason!r}" if reason else "")
+                        )
+                else:
+                    # Malformed/empty submit 
+                    submit_format_fails += 1
+                    clean_result = {k: v for k, v in result.items() if k != "_internal"}
+                    clean_result["submitted"] = False
+                    clean_result["rejected"] = submit_rejected_why
+                    result = clean_result
+                    if verbose or debug:
+                        print(
+                            f"[agent] submit REJECTED "
+                            f"({submit_format_fails}/{_MAX_SUBMIT_FAILS}): "
+                            f"{submit_rejected_why}"
+                        )
             else:
                 update_best(best, result, verbose)
                 update_last_proposal(last_proposal, result)
@@ -900,9 +1008,6 @@ def _run_agent_loop(
             }
             _log(log_entry)
 
-            # Strip internal tracking data, LLM only sees the clean feedback,
-            # and doesnt need to see its own plan
-            # so for dual agents, network designer doesnt see the proposed car plan
             clean_result = {k: v for k, v in result.items() if k != "_internal"}
             if debug:
                 print(f"\n[agent:raw] --- tool call #{tool_calls_made}: {name} ---")
@@ -931,9 +1036,52 @@ def _run_agent_loop(
                 }
             )
 
-            # If args were malformed, inject a format reminder so the model
-            # knows what went wrong and can retry with the correct structure
-            if args_malformed:
+            if submit_rejected_why is not None:
+                hint = _tool_hints.get(name, f"check the schema for {name}")
+                last_try = submit_format_fails >= _MAX_SUBMIT_FAILS
+                reminder = (
+                    f"Your `{name}` was NOT accepted: {submit_rejected_why}. It was not "
+                    f"committed. Re-send `{name}` with the COMPLETE arguments as one valid "
+                    f"JSON object (required: {hint}); include every road and every car, and "
+                    f"keep any 'reason' short so the JSON is not truncated."
+                )
+                messages.append({"role": "user", "content": reminder})
+                _log(
+                    {
+                        "type": "submit_rejected",
+                        "tool": name,
+                        "reason": submit_rejected_why,
+                        "attempt": submit_format_fails,
+                        "max_attempts": _MAX_SUBMIT_FAILS,
+                        "raw_args": tc.function.arguments,
+                    }
+                )
+                if verbose or debug:
+                    print(f"[agent] !!! submit rejected reminder injected for {name}")
+                if last_try:
+                    _log(
+                        {
+                            "type": "submit_format_failed",
+                            "reason": "too_many_malformed_submits",
+                            "attempts": submit_format_fails,
+                            "max_attempts": _MAX_SUBMIT_FAILS,
+                            "last_reason": submit_rejected_why,
+                            "content": (
+                                f"Agent failed to submit a well-formed solution "
+                                f"{submit_format_fails} times; session ended without a "
+                                f"committed answer."
+                            ),
+                        }
+                    )
+                    aborted = True
+                    if verbose or debug:
+                        print(
+                            f"[agent] WARNING: {submit_format_fails} malformed submit "
+                            f"attempts --- stopping."
+                        )
+
+            # If a non-submit tool had malformed args, inject the generic format
+            elif args_malformed and name not in _SUBMIT_NAMES:
                 hint = _tool_hints.get(name, f"check the schema for {name}")
                 reminder = (
                     f"Your call to `{name}` had missing or malformed arguments "
@@ -953,7 +1101,7 @@ def _run_agent_loop(
                 if verbose or debug:
                     print(f"[agent] !!! format reminder injected for {name}")
 
-            if done:
+            if done or aborted:
                 break  # stop processing remaining tool calls in this batch
 
     if (verbose or debug) and not done:
@@ -1005,28 +1153,35 @@ def _run_agent_loop(
         "all_delivered": _final_snap["all_delivered"] if _final_snap else False,
         "occ": _final_snap["occ"] if _final_snap else None,
         "solve_status": (
-            "AGENT_OPTIMAL" if best["makespan"] is not None else "AGENT_FAILED"
+            "AGENT_OPTIMAL"
+            if (_final_snap and _final_snap["makespan"] is not None)
+            else "AGENT_FAILED"
         ),
         "tool_calls_cnt": tool_calls_made,
-        # Full snapshots for comparison / visualization
+        # _best is saved for diagnostics only and it never read by the result
         "_best": _best_snap,
         "_final": _final_snap,
     }
     return meta_out, logs
 
 
+# ---------------------------------------------------------------------------
 # System prompts
+# ---------------------------------------------------------------------------
 
 _TERRAIN_RULES_TEXT = """\
 Terrain build rules (cost = base_cost × capacity):
-  grass    -> base_cost=1,  max_capacity=5  (cheapest)
-  water    -> base_cost=5,  max_capacity=3
-  mountain -> base_cost=10, max_capacity=2  (most expensive)
-  building -> cannot build roads here"""
+  grass    → base_cost=1,  max_capacity=5  (cheapest)
+  water    → base_cost=5,  max_capacity=3
+  mountain → base_cost=10, max_capacity=2  (most expensive)
+  building → cannot build roads here"""
 
 _ROAD_RULES_TEXT = """\
 Road rules:
   • Cars travel only on ROAD tiles.
+  • Each car moves ONE tile at a time (up/down/left/right). A path must be a
+    continuous chain from DEPOT_OUT to DEPOT_IN with NO jumps/teleports — every
+    consecutive pair of positions must be 4-adjacent (differ by exactly one tile).
   • Depots are endpoints only — cars cannot pass through them as intermediate tiles.
   • Road capacity = max cars simultaneously on that tile.
   • When tiles are over-capacity, cars queue and makespan increases.
@@ -1072,7 +1227,7 @@ building a well-connected, well-capacitated network.
 
 Design tips:
   • Build direct paths between each OUT↔IN depot pair.
-  • Higher capacity (2-5) on shared/bottleneck tiles reduces queuing.
+  • Higher capacity (2–5) on shared/bottleneck tiles reduces queuing.
   • Avoid expensive terrain (mountain/water) when cheaper alternatives exist.
   • Parallel routes let multiple depot pairs deliver simultaneously.
 
@@ -1093,7 +1248,7 @@ with minimum makespan.
 How the pipeline works:
   • Each time you call propose_network, a separate routing AI agent will find the
     best possible car routes on your network and replay them in the simulator.
-  • The makespan you receive back is exact - it is the actual simulation result.
+  • The makespan you receive back is exact — it is the actual simulation result.
   • If your network is invalid (disconnected depots, over budget), no routing is
     attempted and you will receive an error immediately.
   • Use the makespan and error feedback to iteratively improve your network design.
@@ -1115,7 +1270,7 @@ Important — routing results can vary between calls:
 
 Design tips:
   • Build direct paths between each OUT↔IN depot pair.
-  • Higher capacity (2-5) on shared/bottleneck tiles reduces queuing.
+  • Higher capacity (2–5) on shared/bottleneck tiles reduces queuing.
   • Avoid expensive terrain (mountain/water) when cheaper alternatives exist.
   • Parallel routes let multiple depot pairs deliver simultaneously.
 
@@ -1132,9 +1287,9 @@ You are a routing agent in a two-agent pipeline for a grid-based traffic simulat
 
 The road network has already been built by a separate network design agent.
 Your task: find the best possible car routes on this network to minimise makespan.
-The simulation will replay your plan exactly - makespan is the actual result.
+The simulation will replay your plan exactly — makespan is the actual result.
 
-This is a single evaluation run - do your best within the allowed tool calls,
+This is a single evaluation run — do your best within the allowed tool calls,
 then call submit_routes to commit your best answer.
 
 {_ROAD_RULES_TEXT}
@@ -1144,7 +1299,7 @@ Routing tips:
   • path[-1] must be the DEPOT_IN position itself.
   • All intermediate path tiles must be ROAD.
   • Stagger departure ticks to avoid congestion on shared tiles.
-  • The simulation replays your plan exactly - makespan is the actual result.
+  • The simulation replays your plan exactly — makespan is the actual result.
 
 Car output format (used in propose_routes):
   {{"cars": [{{"from": depot_out_id, "to": depot_in_id,
@@ -1214,7 +1369,9 @@ Car output format (used in propose_routes):
 """
 
 
+# ---------------------------------------------------------------------------
 # Public entry points
+# ---------------------------------------------------------------------------
 
 
 def solve_joint(
@@ -1274,10 +1431,7 @@ def solve_network(
     verbose: bool = True,
     debug: bool = False,
 ) -> dict:
-    """Single LLM designs network only; route_solver evaluates routing.
-
-    Returns meta with _final and _best snapshots.
-    """
+    
     if route_solver is None:
         from solvers.rule_based import solve_routing as route_solver  # type: ignore
 
@@ -1321,10 +1475,7 @@ def solve_routing(
     verbose: bool = True,
     debug: bool = False,
 ) -> dict:
-    """Route-planning agent on a sim that already has a road network.
-    Uses simulation replay for makespan evaluation.
-    Returns meta with _final and _best snapshots.
-    """
+
     client = _build_client(api_key)
     world_json = world_to_json(sim)
     routes_exec = _make_routes_executor(sim)
@@ -1366,15 +1517,7 @@ def run_dual_agent(
     verbose: bool = True,
     debug: bool = False,
 ) -> dict:
-    """Two-agent pipeline: network agent designs roads, route agent plans routes.
-    For each propose_network call from the network agent:
-      1. The proposed roads are validated (connectivity + budget).
-      2. If valid, a fresh route agent loop runs on that network and finds the
-         best routes via simulation replay, meanwhile no route_solver involved.
-      3. The actual makespan (or validation error) is returned as feedback to
-         the network agent.
-    The network agent iterates until it calls submit_network.
-    """
+   
     client = _build_client(api_key)
     world_json = world_to_json(sim)
 
@@ -1449,8 +1592,6 @@ def run_dual_agent(
         )
         route_calls_log.append(route_meta.get("tool_calls_cnt", 0))
 
-        # All fields come from the same snapshot so makespan/car_plan/delivered
-        # are always consistent with each other.
         if route_meta.get("_final", {}).get("if_submit") == "submitted":
             snap = route_meta.get("_final")
         else:
@@ -1533,3 +1674,191 @@ def run_dual_agent(
         "_final": net_meta.get("_final"),
     }
     return meta
+
+
+
+#----------------Validation----------------------------------------------
+
+def compare_solutions(meta: dict) -> dict:
+    """Compare the best-during-iteration vs the agent's final proposal.
+    Check if the submission is valid solution. (no teleporting, no over-capacity, all cars delivered, etc.)
+    """
+    snap_b = meta.get("_best")
+    snap_f = meta.get("_final")  # None when agent never submitted
+    if snap_f is None:
+        snap_f = {}
+        print(
+            "[compare_solutions] no final submission found; comparing best vs empty final"
+        )
+
+    if snap_b is None and snap_f is None:
+        return {"error": "no _best or _final snapshots found in meta"}
+
+    snap_b = snap_b or {}
+    snap_f = snap_f or {}
+
+    ms_b = snap_b.get("makespan")
+    ms_f = snap_f.get("makespan")
+    rc_b = snap_b.get("road_cost")
+    rc_f = snap_f.get("road_cost")
+
+    # Road-tile comparison
+    def _roads_to_dict(roads: list) -> dict:
+        out = {}
+        for r in roads:
+            pos = r.get("pos", [])
+            key = (
+                (pos[0], pos[1])
+                if isinstance(pos, list) and len(pos) == 2
+                else tuple(pos)
+            )
+            out[key] = r.get("capacity", 1)
+        return out
+
+    rd_b = _roads_to_dict(snap_b.get("roads", []))
+    rd_f = _roads_to_dict(snap_f.get("roads", []))
+
+    common = set(rd_b) & set(rd_f)
+    only_best = sorted(set(rd_b) - set(rd_f))
+    only_final = sorted(set(rd_f) - set(rd_b))
+    cap_changed = [
+        {"pos": list(p), "cap_best": rd_b[p], "cap_final": rd_f[p]}
+        for p in sorted(common)
+        if rd_b[p] != rd_f[p]
+    ]
+    roads_identical = not only_best and not only_final and not cap_changed
+
+    # Route comparison
+    cp_b = snap_b.get("car_plan", [])
+    cp_f = snap_f.get("car_plan", [])
+    routes_identical = cp_b == cp_f
+
+    solutions_identical = (
+        ms_b == ms_f and rc_b == rc_f and roads_identical and routes_identical
+    )
+
+    return {
+        "solutions_identical": solutions_identical,
+        "final_all_delivered": snap_f.get("all_delivered", False),
+        "makespan_best": ms_b,
+        "makespan_final": ms_f,
+        "makespan_delta": (
+            (ms_f - ms_b) if (ms_b is not None and ms_f is not None) else None
+        ),
+        "road_cost_best": rc_b,
+        "road_cost_final": rc_f,
+        "road_cost_delta": (
+            (rc_f - rc_b) if (rc_b is not None and rc_f is not None) else None
+        ),
+        "roads_only_in_best": [list(p) for p in only_best],
+        "roads_only_in_final": [list(p) for p in only_final],
+        "roads_capacity_changed": cap_changed,
+        "roads_identical": roads_identical,
+        "cars_count_best": len(cp_b),
+        "cars_count_final": len(cp_f),
+        "routes_identical": routes_identical,
+    }
+
+
+def validate_agent_result(
+    sim: TrafficSim,
+    meta: dict,
+    which: str = "_final",
+    makespan_tolerance: int = 0,
+    max_ticks: int = 10_000,
+) -> dict:
+  
+    result = {
+        "snapshot": which,
+        "has_solution": False,
+        "network_connected": False,
+        "connectivity_errors": [],
+        "replayable": False,  # False for flow-based routing (no car-level plan)
+        "plan_executable": None,  # None = not verifiable (no car_plan to replay)
+        "plan_errors": [],
+        "claimed_makespan": None,
+        "actual_makespan": None,
+        "makespan_match": None,  # None = not verifiable
+        "actual_all_delivered": False,
+        "timed_out": False,
+        "road_cost": None,
+        "valid": False,
+    }
+
+    snap = meta.get(which)
+    if not snap:
+        result["plan_errors"] = [
+            f"meta has no '{which}' snapshot (agent produced no committed solution)"
+        ]
+        return result
+    result["has_solution"] = True
+
+    claimed = snap.get("makespan")
+    result["claimed_makespan"] = claimed
+
+    # 1. Rebuild the proposed network on a fresh copy of the original sim.
+    #    Agent runs save the RAW grid (no roads) as their sim.pkl the road
+    #    network lives only in the snapshot, so we reconstruct it here. This is
+    #    idempotent for routing solvers whose sim already carries these roads.
+    sim_copy = copy.deepcopy(sim)
+    road_errors = _apply_roads(sim_copy, snap.get("roads", []))
+    result["road_cost"] = sum(
+        sim_copy.calculate_road_cost(p, c) for p, c in sim_copy.road_capacity.items()
+    )
+
+    # 2. Connectivity — depot-in reachable from depot-out over the road network.
+    connectivity_errors = _check_connectivity(sim_copy)
+    result["connectivity_errors"] = road_errors + connectivity_errors
+    result["network_connected"] = not connectivity_errors and not road_errors
+
+    # 3. Departure plan and structural validation, then full replay.
+    #    Snapshots round-tripped through JSON have list positions/keys; the sim
+    #    uses positions as dict keys during replay, so normalise to tuples/ints.
+    car_plan = _normalize_car_plan(snap.get("car_plan") or [])
+    departures = {int(k): int(v) for k, v in (snap.get("departures") or {}).items()}
+
+    if car_plan:
+        result["replayable"] = True
+        ok_struct, plan_errors = validate_plan(sim_copy, car_plan, departures)
+        sim_copy.car_plan = car_plan
+        sim_copy.saved_departures = departures
+        ev = evaluate(sim_copy, max_ticks=max_ticks)
+        result["actual_makespan"] = ev.get("makespan")
+        result["actual_all_delivered"] = ev.get("all_delivered", False)
+        result["timed_out"] = ev.get("timed_out", False)
+        result["plan_errors"] = plan_errors
+        result["plan_executable"] = (
+            ok_struct
+            and result["actual_all_delivered"]
+            and not result["timed_out"]
+        )
+        # 4. Makespan agreement agent's claim vs independent replay.
+        actual = result["actual_makespan"]
+        if claimed is not None and actual is not None:
+            result["makespan_match"] = abs(claimed - actual) <= makespan_tolerance
+    else:
+        result["plan_errors"] = [
+            "snapshot has empty car_plan (flow-based routing); "
+            "makespan not independently replayable"
+        ]
+
+    # only connectivity gates validity.
+    checks = [result["network_connected"]]
+    if result["replayable"]:
+        checks += [bool(result["plan_executable"]), bool(result["makespan_match"])]
+    result["valid"] = all(checks)
+    return result
+
+
+def _normalize_car_plan(car_plan: list[dict]) -> list[dict]:
+    """Return a copy of car_plan with positions coerced to tuples.
+    """
+    normalized: list[dict] = []
+    for entry in car_plan:
+        e = dict(entry)
+        if e.get("path") is not None:
+            e["path"] = [tuple(p) for p in e["path"]]
+        if e.get("depot_out_pos") is not None:
+            e["depot_out_pos"] = tuple(e["depot_out_pos"])
+        normalized.append(e)
+    return normalized
